@@ -53,27 +53,38 @@ func (e *Engine) Rebuild(ctx context.Context, name string, chunkSize int) error 
 			n = int(rem)
 		}
 
-		src, ok := e.pickSource(target)
-		if !ok {
-			e.abortRebuild(target)
-			return fmt.Errorf("rebuild %q: %w", name, ErrNoInSync)
-		}
-		if _, rerr := src.dev.ReadAt(buf[:n], off); rerr != nil {
-			e.abortRebuild(target)
-			return fmt.Errorf("rebuild %q: read source %q at %d: %w", name, src.name, off, rerr)
-		}
-
-		if !e.stillRebuilding(target) {
-			// A concurrent live write failed on the target and demoted it.
-			return fmt.Errorf("rebuild %q: target demoted mid-rebuild: %w", name, ErrNoInSync)
-		}
-		if _, werr := target.dev.WriteAt(buf[:n], off); werr != nil {
-			e.abortRebuild(target)
-			return fmt.Errorf("rebuild %q: write target at %d: %w", name, off, werr)
+		if err := e.copyChunk(target, buf[:n], off); err != nil {
+			e.abortRebuild(target) // no-op if a live write already demoted the target
+			return err
 		}
 	}
 
 	return e.finishRebuild(target)
+}
+
+// copyChunk copies one chunk [off, off+len(buf)) from a live in-sync source to
+// the target while holding writeMu, so the (read source → write target) is
+// atomic with respect to live writes: a concurrent WriteAt to the same chunk
+// cannot interleave between the read and the write and leave the target holding
+// a stale value (which would diverge it from the source). It returns an error
+// early if the target was already demoted by a prior live-write failure.
+func (e *Engine) copyChunk(target *replicaState, buf []byte, off int64) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if !e.stillRebuilding(target) {
+		return fmt.Errorf("rebuild %q: target demoted mid-rebuild: %w", target.name, ErrNoInSync)
+	}
+	src, ok := e.pickSource(target)
+	if !ok {
+		return fmt.Errorf("rebuild %q: %w", target.name, ErrNoInSync)
+	}
+	if _, rerr := src.dev.ReadAt(buf, off); rerr != nil {
+		return fmt.Errorf("rebuild %q: read source %q at %d: %w", target.name, src.name, off, rerr)
+	}
+	if _, werr := target.dev.WriteAt(buf, off); werr != nil {
+		return fmt.Errorf("rebuild %q: write target at %d: %w", target.name, off, werr)
+	}
+	return nil
 }
 
 // beginRebuild validates the target and flips it to Rebuilding under the lock.

@@ -117,6 +117,10 @@ func joinErrs(results []opResult) error {
 // a replica that errors is marked out-of-sync. The write fails only if fewer
 // than MinInSync in-sync replicas remain.
 func (e *Engine) WriteAt(p []byte, off int64) (int, error) {
+	// Serialize against other writes and against a rebuild's chunk copy, so the
+	// fan-out is atomic w.r.t. a concurrent rebuild of the same chunk.
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	err := e.mirror("WriteAt", func(rs *replicaState) error {
 		n, werr := rs.dev.WriteAt(p, off)
 		if werr != nil {

@@ -26,21 +26,11 @@ type memDevice struct {
 	closeErr  error
 	sizeErr   error
 	sizeValue *int64 // override reported size when non-nil
-
-	// readHook, if set, fires once at the start of each ReadAt (used to inject a
-	// concurrent live write mid-rebuild). It runs without m.mu held.
-	readHook func()
 }
 
 func newMem(n int) *memDevice { return &memDevice{data: make([]byte, n)} }
 
 func (m *memDevice) ReadAt(p []byte, off int64) (int, error) {
-	m.mu.Lock()
-	hook := m.readHook
-	m.mu.Unlock()
-	if hook != nil {
-		hook()
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.readErr != nil {
@@ -525,39 +515,48 @@ func TestRebuildDefaultChunkSize(t *testing.T) {
 	}
 }
 
-func TestRebuildDemotedMidFlight(t *testing.T) {
-	// Drive the stillRebuilding/finishRebuild demotion branch: the target's
-	// write starts failing after the rebuild flips it to Rebuilding, so a live
-	// write demotes it before the stream completes.
-	r0 := newMem(1 << 16)
-	r1 := newMem(1 << 16)
+// copyChunk holds the engine's writeMu across each chunk's (read source → write
+// target), so a concurrent live write to that chunk cannot interleave and leave
+// the target stale — that atomicity is what TestRebuildWithLiveWrites exercises.
+// Its mid-rebuild error branches (target demoted by a prior live write, or the
+// last in-sync source lost) are driven deterministically here, white-box, since
+// forcing the interleaving with a synchronous live write would (correctly) block
+// on writeMu.
+func TestCopyChunkTargetDemoted(t *testing.T) {
+	r0, r1 := newMem(4096), newMem(4096)
 	e := mustEngine(t, []*memDevice{r0, r1}, Config{MinInSync: 1})
-	r1.setWriteErr(errors.New("down"))
-	_, _ = e.WriteAt(make([]byte, 16), 0)
-	r1.setWriteErr(nil)
-
-	// A source read hook that demotes r1 via a failing live write on the first
-	// chunk, before the rebuild writes the target.
-	demoted := make(chan struct{})
-	var once sync.Once
-	r0.mu.Lock()
-	r0.readHook = func() {
-		once.Do(func() {
-			r1.setWriteErr(errors.New("target died mid-rebuild"))
-			if _, err := e.WriteAt([]byte{1, 2, 3, 4}, 0); err != nil {
-				t.Errorf("live write: %v", err)
-			}
-			close(demoted)
-		})
+	target := e.byName["r1"]
+	target.state = OutOfSync // a prior live write demoted it mid-rebuild
+	if err := e.copyChunk(target, make([]byte, 512), 0); !errors.Is(err, ErrNoInSync) {
+		t.Fatalf("copyChunk on a demoted target: err=%v, want ErrNoInSync", err)
 	}
-	r0.mu.Unlock()
+}
 
-	if err := e.Rebuild(context.Background(), "r1", 4096); err == nil {
-		t.Fatal("expected mid-rebuild demotion error")
+func TestCopyChunkNoSource(t *testing.T) {
+	r0, r1 := newMem(4096), newMem(4096)
+	e := mustEngine(t, []*memDevice{r0, r1}, Config{MinInSync: 1})
+	target := e.byName["r1"]
+	target.state = Rebuilding
+	e.byName["r0"].state = OutOfSync // the only other replica is gone → no source
+	if err := e.copyChunk(target, make([]byte, 512), 0); !errors.Is(err, ErrNoInSync) {
+		t.Fatalf("copyChunk with no in-sync source: err=%v, want ErrNoInSync", err)
 	}
-	<-demoted
+}
+
+func TestWriteDemotesFailingRebuildingReplica(t *testing.T) {
+	// A live write during a rebuild mirrors to the in-sync set AND the rebuilding
+	// target. If the rebuilding target's write fails, it drops back to out-of-sync
+	// (its rebuild is now invalid) while the write still succeeds via the in-sync
+	// replica. This drives the Rebuilding arm of targets() and demote().
+	r0, r1 := newMem(4096), newMem(4096)
+	e := mustEngine(t, []*memDevice{r0, r1}, Config{MinInSync: 1})
+	e.byName["r1"].state = Rebuilding
+	r1.setWriteErr(errors.New("rebuild target write failed"))
+	if _, err := e.WriteAt([]byte{1, 2, 3}, 0); err != nil {
+		t.Fatalf("WriteAt: in-sync r0 acked, want success, got %v", err)
+	}
 	if e.Status()[1].State != OutOfSync {
-		t.Fatalf("target state = %s, want out-of-sync", e.Status()[1].State)
+		t.Fatalf("rebuilding replica state = %s, want out-of-sync after a failed write", e.Status()[1].State)
 	}
 }
 
@@ -630,37 +629,6 @@ func TestFinishRebuildDemoted(t *testing.T) {
 	e.mu.Unlock()
 	if err := e.finishRebuild(target); !errors.Is(err, ErrNoInSync) {
 		t.Fatalf("finishRebuild demoted = %v, want ErrNoInSync", err)
-	}
-}
-
-func TestRebuildSourceLostMidLoop(t *testing.T) {
-	// The source is in-sync at beginRebuild but is demoted before a later
-	// chunk's pickSource, exercising Rebuild's "no source" abort inside the loop.
-	r0 := newMem(2048) // source
-	r1 := newMem(2048) // rebuild target
-	e := mustEngine(t, []*memDevice{r0, r1}, Config{MinInSync: 1, Local: "r0"})
-
-	// Demote r1 so it becomes the rebuild target.
-	r1.setWriteErr(errors.New("down"))
-	_, _ = e.WriteAt(make([]byte, 16), 0)
-	r1.setWriteErr(nil)
-
-	// On the first source read, demote r0 via a failing live write. With r1 only
-	// Rebuilding (uncounted) the write drops below the minimum and fails, marking
-	// r0 out-of-sync; the next chunk then finds no source.
-	var once sync.Once
-	r0.mu.Lock()
-	r0.readHook = func() {
-		once.Do(func() {
-			r0.setWriteErr(errors.New("source died"))
-			_, _ = e.WriteAt(make([]byte, 4), 0) // fails, demotes r0
-		})
-	}
-	r0.mu.Unlock()
-
-	// Two chunks (1024 each) so a second pickSource happens after r0 is gone.
-	if err := e.Rebuild(context.Background(), "r1", 1024); !errors.Is(err, ErrNoInSync) {
-		t.Fatalf("Rebuild err = %v, want ErrNoInSync", err)
 	}
 }
 

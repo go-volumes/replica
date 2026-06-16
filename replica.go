@@ -141,6 +141,14 @@ type Engine struct {
 	closed  bool
 
 	rebuildMu sync.Mutex // serializes Rebuild so at most one runs at a time
+
+	// writeMu serializes live writes against each other AND against a rebuild's
+	// per-chunk copy. Holding it makes a WriteAt's fan-out and a rebuild's
+	// (read-source → write-target) mutually exclusive, so a rebuild can never
+	// overwrite a concurrent live write on the target with a stale value
+	// (which would diverge the target from the source), and all replicas see
+	// writes in one order.
+	writeMu sync.Mutex
 }
 
 // Compile-time assertion that *Engine satisfies the volume contract.
