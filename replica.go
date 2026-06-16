@@ -77,15 +77,26 @@ type ReplicaStatus struct {
 	State State
 }
 
-// Fencer is the seam the future control plane uses to STONITH a stale writer
-// before promoting a new one. The Engine does not call it (single-active-writer
-// fencing is a control-plane decision); it is held so a higher layer can fence
-// through the same object that owns the replicas.
+// Fencer is the seam a control plane uses to STONITH a stale writer before
+// promoting a new one. The Engine does not call it (single-active-writer fencing
+// is a control-plane decision — see github.com/go-volumes/replica-ha); it is
+// held so a higher layer can fence through the same object that owns the
+// replicas.
 type Fencer interface {
-	// Fence isolates the named replica/writer so it can no longer issue writes,
-	// making it safe to promote another. Implementations back this with their
-	// own mechanism (power control, network ACL, lease revocation).
-	Fence(ctx context.Context, replica string) error
+	// Fence must isolate the named writer so it can no longer issue a single
+	// write to the shared replicas, and return nil ONLY once that is definitively
+	// true. A control plane opens the new leader's write gate the moment Fence
+	// returns nil, so a Fencer that returns nil WITHOUT actually stopping the old
+	// writer silently re-introduces split-brain and corrupts the volume. When in
+	// doubt, return an error: a failed fence keeps the new leader passive (safe);
+	// a falsely-successful one is unsafe.
+	//
+	// Implementations back this with whatever the substrate offers, strongest
+	// first: power/STONITH (hard-stop the node or micro-VM), a cloud force-detach
+	// or power-off, an IPMI/PDU cut or network ACL, or revoking the credential the
+	// writer presents to the replicas. Fence should be idempotent (fencing an
+	// already-dead writer returns nil) and must honour ctx (a timeout → error).
+	Fence(ctx context.Context, writer string) error
 }
 
 // Config tunes an [Engine]. The zero value is valid: MinInSync defaults to 1
