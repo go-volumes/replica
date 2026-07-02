@@ -1,4 +1,8 @@
-# go-volumes/replica
+# replica
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-volumes/replica.svg)](https://pkg.go.dev/github.com/go-volumes/replica)
+[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
+[![CI](https://github.com/go-volumes/replica/actions/workflows/ci.yml/badge.svg)](https://github.com/go-volumes/replica/actions/workflows/ci.yml)
 
 A pure-Go (`CGO_ENABLED=0`), standard-library-only **replication engine** for
 highly-available block volumes in the go-volumes family. It fronts N synchronous
